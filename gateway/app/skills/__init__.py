@@ -8,6 +8,7 @@ without touching the wire.
 """
 
 from app.skills.assembler import (
+    DEFAULT_REFERENCE_CHAR_BUDGET,
     SKILL_INPUT_VARIABLE_RE,
     assemble_skill_prompt,
     consumes_organization_profile,
@@ -16,6 +17,7 @@ from app.skills.assembler import (
 )
 
 __all__ = [
+    "DEFAULT_REFERENCE_CHAR_BUDGET",
     "SKILL_INPUT_VARIABLE_RE",
     "assemble_skill_prompt",
     "consumes_organization_profile",

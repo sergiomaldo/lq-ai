@@ -249,6 +249,112 @@ def test_assemble_includes_reference_files_in_separate_blocks() -> None:
     assert "ref b" in out
 
 
+# --- reference-material size budget ------------------------------------------
+
+
+@pytest.mark.unit
+def test_assemble_reference_under_budget_is_untouched() -> None:
+    """A reference comfortably under the budget is emitted verbatim, no marker."""
+
+    skill = Skill(
+        name="alpha",
+        title="Alpha",
+        content_md="Body",
+        content_yaml="name: alpha\n",
+        reference_files=[SkillFile(path="reference/a.md", content="short reference text")],
+    )
+    out = assemble_skill_prompt([skill], reference_char_budget=1000)
+    assert "short reference text" in out
+    assert "truncated" not in out
+    assert "omitted" not in out
+
+
+@pytest.mark.unit
+def test_assemble_reference_over_budget_truncates_with_visible_marker() -> None:
+    """A reference larger than the budget is truncated with a visible marker.
+
+    The omission must be explicit so the model is told the exhibit was cut
+    rather than being left to fill the gap from memory (citation discipline).
+    """
+
+    big = "X" * 500
+    skill = Skill(
+        name="alpha",
+        title="Alpha",
+        content_md="Body",
+        content_yaml="name: alpha\n",
+        reference_files=[SkillFile(path="reference/big.md", content=big)],
+    )
+    out = assemble_skill_prompt([skill], reference_char_budget=100)
+    # The header and a bounded prefix survive; the rest is visibly cut.
+    assert "## Reference: reference/big.md" in out
+    assert "reference truncated" in out
+    assert "characters omitted" in out
+    # Far fewer than the original 500 X's make it through.
+    assert out.count("X") <= 100
+
+
+@pytest.mark.unit
+def test_assemble_reference_budget_is_shared_across_files() -> None:
+    """The budget is a single pool across every reference file in the assembly.
+
+    The first file consumes the whole budget; the second is omitted with a
+    visible marker rather than silently dropped.
+    """
+
+    skill = Skill(
+        name="alpha",
+        title="Alpha",
+        content_md="Body",
+        content_yaml="name: alpha\n",
+        reference_files=[
+            SkillFile(path="reference/first.md", content="A" * 100),
+            SkillFile(path="reference/second.md", content="B" * 100),
+        ],
+    )
+    out = assemble_skill_prompt([skill], reference_char_budget=100)
+    # First file fits exactly and is emitted.
+    assert "A" * 100 in out
+    # Second file's header is still present (the model sees a reference existed)
+    # but its body is the exhausted-budget marker, not the B's.
+    assert "## Reference: reference/second.md" in out
+    assert "budget exhausted" in out
+    assert "B" * 100 not in out
+
+
+@pytest.mark.unit
+def test_assemble_reference_budget_none_disables_cap() -> None:
+    """``reference_char_budget=None`` injects all reference material verbatim."""
+
+    big = "Y" * 5000
+    skill = Skill(
+        name="alpha",
+        title="Alpha",
+        content_md="Body",
+        content_yaml="name: alpha\n",
+        reference_files=[SkillFile(path="reference/big.md", content=big)],
+    )
+    out = assemble_skill_prompt([skill], reference_char_budget=None)
+    assert big in out
+    assert "truncated" not in out
+
+
+@pytest.mark.unit
+def test_assemble_no_reference_files_is_unaffected_by_budget() -> None:
+    """A skill with no reference files renders identically regardless of budget."""
+
+    skill = Skill(
+        name="alpha",
+        title="Alpha",
+        content_md="Body content here",
+        content_yaml="name: alpha\n",
+    )
+    with_budget = assemble_skill_prompt([skill], reference_char_budget=10)
+    without_budget = assemble_skill_prompt([skill], reference_char_budget=None)
+    assert with_budget == without_budget
+    assert "Reference" not in with_budget
+
+
 # --- DE-328: unconsumed inputs surfaced as a labelled block ------------------
 
 

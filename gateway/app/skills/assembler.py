@@ -36,6 +36,16 @@ clear ``## Reference: <path>`` header. Reference content is verbatim;
 the model sees both the skill's instructions and the reference exhibits
 in one block.
 
+Reference material is bounded by a shared per-assembly character budget
+(:data:`DEFAULT_REFERENCE_CHAR_BUDGET`, overridable via the
+``reference_char_budget`` argument) so a pathologically large reference set
+cannot blow the model's context window. When the budget is exhausted the
+offending file is truncated (or omitted) with a *visible* marker — the omission
+is never silent, preserving the "no memory citation" discipline: the model is
+told a reference was cut rather than left to fill the gap from memory. There is
+no per-file opt-out today; the skill schema carries no such flag, so all
+reference files are included up to the budget in caller-supplied order.
+
 Required-input enforcement
 --------------------------
 
@@ -79,6 +89,52 @@ _SKILL_SEPARATOR: Final[str] = "\n\n---\n\n"
 # message. The model sees: skill block, separator, original system
 # instruction.
 _PREPEND_SEPARATOR: Final[str] = "\n\n---\n\n## Operator system instructions\n\n"
+
+# Default cap on the *total* characters of reference-file material injected
+# across all skills in a single assembly. Reference files (checklists, rubrics,
+# verified statutory text) are the citation-discipline backbone of a skill, but
+# a skill with megabytes of statutory text could otherwise blow the model's
+# context window and crowd out the conversation. The cap is generous enough that
+# ordinary skills are never touched and only pathologically large reference sets
+# are truncated — with a visible marker so the omission is never silent. Pass
+# ``reference_char_budget=None`` to :func:`assemble_skill_prompt` to disable the
+# cap entirely (e.g., for an operator who has sized their context accordingly).
+DEFAULT_REFERENCE_CHAR_BUDGET: Final[int] = 24_000
+
+
+class _ReferenceBudget:
+    """Running character budget shared across every reference file in one
+    assembly.
+
+    ``remaining is None`` means the budget is disabled (unbounded). Otherwise
+    each reference file draws down ``remaining``; once it is exhausted, further
+    reference bodies are replaced by a visible ``[reference omitted ...]`` marker
+    so the model can still see that a reference existed and was dropped. A file
+    that only partially fits is truncated at the remaining budget with a visible
+    ``[... reference truncated ...]`` marker.
+    """
+
+    def __init__(self, total: int | None) -> None:
+        self.remaining: int | None = total
+
+    def take(self, content: str) -> str:
+        """Return the (possibly truncated) reference body to emit, drawing the
+        consumed characters down from the shared budget."""
+
+        if self.remaining is None:
+            return content
+        if self.remaining <= 0:
+            return "[reference omitted — total reference budget exhausted]"
+        if len(content) <= self.remaining:
+            self.remaining -= len(content)
+            return content
+        kept = content[: self.remaining]
+        omitted = len(content) - self.remaining
+        self.remaining = 0
+        return (
+            f"{kept}\n\n[... reference truncated: {omitted} characters omitted "
+            f"to fit the reference budget ...]"
+        )
 
 
 def interpolate(
@@ -222,8 +278,18 @@ class _AssembledSkill:
     text: str
 
 
-def _render_skill(skill: Skill, *, inputs: dict[str, Any]) -> _AssembledSkill:
-    """Render one skill's body + references with input substitution applied."""
+def _render_skill(
+    skill: Skill,
+    *,
+    inputs: dict[str, Any],
+    ref_budget: _ReferenceBudget | None = None,
+) -> _AssembledSkill:
+    """Render one skill's body + references with input substitution applied.
+
+    ``ref_budget`` is the shared :class:`_ReferenceBudget` for the whole
+    assembly; reference-file bodies draw down from it so the total injected
+    reference material stays bounded. ``None`` disables the cap.
+    """
 
     parts: list[str] = []
     header = f"# Skill: {skill.title or skill.name}"
@@ -251,7 +317,13 @@ def _render_skill(skill: Skill, *, inputs: dict[str, Any]) -> _AssembledSkill:
     # is the right default.
     for ref in skill.reference_files:
         ref_body = interpolate(ref.content or "", inputs, consumed=consumed)
-        parts.append(f"## Reference: {ref.path}\n\n{ref_body.strip()}\n")
+        # Draw the (already-substituted) reference body down from the shared
+        # budget so the total reference material across all skills stays
+        # bounded; the budget returns the body verbatim when the cap is
+        # disabled or the file fits, and a visibly-marked truncation/omission
+        # otherwise.
+        emitted = ref_budget.take(ref_body) if ref_budget is not None else ref_body
+        parts.append(f"## Reference: {ref.path}\n\n{emitted.strip()}\n")
 
     # DE-328 (Option A) — surface caller-bound inputs that no
     # ``{{placeholder}}`` consumed. None of the built-in skill bodies use
@@ -282,6 +354,7 @@ def assemble_skill_prompt(
     skill_inputs: dict[str, dict[str, Any]] | None = None,
     existing_system_message: str | None = None,
     organization_profile: Skill | None = None,
+    reference_char_budget: int | None = DEFAULT_REFERENCE_CHAR_BUDGET,
 ) -> str:
     """Build the system-prompt block from the given skills.
 
@@ -293,6 +366,17 @@ def assemble_skill_prompt(
         existing_system_message: The user's pre-existing system message
             (if any). When non-empty, the assembled skill block is
             *prepended* to it with a clear separator.
+        reference_char_budget: Maximum total characters of reference-file
+            material injected across all skills in this assembly. Reference
+            files are appended verbatim (they carry the citation-discipline
+            exhibits — checklists, rubrics, verified statutory text), but the
+            cap keeps a pathologically large reference set from blowing the
+            model's context window. Truncation/omission is always marked
+            visibly (never silent). ``None`` disables the cap. Defaults to
+            :data:`DEFAULT_REFERENCE_CHAR_BUDGET`. All reference files are
+            included up to the budget in caller-supplied skill order; there is
+            no per-file opt-out (the skill schema carries no such flag today —
+            see the module note).
         organization_profile: D4 — the deployment's Organization
             Profile, if one is set. When provided AND at least one
             attached skill consumes it (per
@@ -347,14 +431,17 @@ def assemble_skill_prompt(
     #    skill consumes it; rendering it through the same path as
     #    skills means it picks up the same header / formatting / input
     #    substitution treatment without a special-case codepath.
+    ref_budget = _ReferenceBudget(reference_char_budget)
     rendered: list[_AssembledSkill] = []
     if organization_profile is not None and any(consumes_organization_profile(s) for s in skills):
         # Profile uses no caller-supplied inputs (its content is the
-        # operator-edited Markdown body); pass an empty bindings dict.
-        rendered.append(_render_skill(organization_profile, inputs={}))
+        # operator-edited Markdown body); pass an empty bindings dict. It
+        # shares the same reference budget so a Profile carrying references
+        # can't bypass the cap.
+        rendered.append(_render_skill(organization_profile, inputs={}, ref_budget=ref_budget))
     for skill in skills:
         bindings = skill_inputs.get(skill.name, {}) or {}
-        rendered.append(_render_skill(skill, inputs=bindings))
+        rendered.append(_render_skill(skill, inputs=bindings, ref_budget=ref_budget))
 
     skill_block = _SKILL_SEPARATOR.join(r.text for r in rendered)
 

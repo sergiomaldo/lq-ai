@@ -384,6 +384,109 @@ async def test_internal_skill_with_user_id_returns_shadow(
 
 
 @pytest.mark.integration
+async def test_internal_skill_shadow_inherits_builtin_reference_files(
+    client_with_key: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A user-scope shadow of a built-in inherits the built-in's reference files.
+
+    Regression test: ``user_skills`` rows carry no storage for reference or
+    example files, so ``_skill_from_user_skill`` emitted ``reference_files: []``.
+    A shadow (which the gateway resolver returns *instead of* the built-in)
+    therefore silently dropped the built-in's reference exhibits — the
+    citation-discipline backbone the assembler injects into chat. The resolver
+    must backfill the built-in's references so the shadow's edited body wins but
+    the exhibits survive.
+    """
+
+    import uuid as _uuid
+
+    from app.models import User, UserSkill
+    from app.security import hash_password
+
+    user = User(
+        email=f"shadow-refs-{_uuid.uuid4().hex[:8]}@example.com",
+        display_name="Shadow Refs",
+        hashed_password=hash_password("correct-horse-battery-staple"),
+        is_admin=False,
+        mfa_enabled=False,
+        must_change_password=False,
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    db_session.add(
+        UserSkill(
+            scope="user",
+            owner_user_id=user.id,
+            slug="alpha-test-skill",
+            display_name="My Alpha",
+            description="user-scope alpha",
+            body="USER-SCOPE-SHADOW-BODY",
+        )
+    )
+    await db_session.flush()
+
+    resp = await client_with_key.get(
+        f"/api/v1/internal/skills/alpha-test-skill?user_id={user.id}",
+        headers={"X-LQ-AI-Gateway-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # Shadow body still wins...
+    assert body["scope"] == "user"
+    assert body["content_md"] == "USER-SCOPE-SHADOW-BODY"
+    # ...but the built-in's reference exhibits are now inherited.
+    ref_paths = {f["path"] for f in body["reference_files"]}
+    assert "reference/note.md" in ref_paths
+
+
+@pytest.mark.integration
+async def test_internal_skill_shadow_without_builtin_keeps_empty_references(
+    client_with_key: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A user skill at a slug with NO filesystem-canonical built-in inherits
+    nothing — there is nothing to backfill, so references stay empty."""
+
+    import uuid as _uuid
+
+    from app.models import User, UserSkill
+    from app.security import hash_password
+
+    user = User(
+        email=f"novel-{_uuid.uuid4().hex[:8]}@example.com",
+        display_name="Novel Skill",
+        hashed_password=hash_password("correct-horse-battery-staple"),
+        is_admin=False,
+        mfa_enabled=False,
+        must_change_password=False,
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    db_session.add(
+        UserSkill(
+            scope="user",
+            owner_user_id=user.id,
+            slug="wholly-novel-user-skill",
+            display_name="Novel",
+            description="no built-in at this slug",
+            body="NOVEL-BODY",
+        )
+    )
+    await db_session.flush()
+
+    resp = await client_with_key.get(
+        f"/api/v1/internal/skills/wholly-novel-user-skill?user_id={user.id}",
+        headers={"X-LQ-AI-Gateway-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scope"] == "user"
+    assert body["content_md"] == "NOVEL-BODY"
+    assert body["reference_files"] == []
+
+
+@pytest.mark.integration
 async def test_internal_skill_user_id_falls_back_to_builtin_when_no_shadow(
     client_with_key: AsyncClient, db_session: AsyncSession
 ) -> None:

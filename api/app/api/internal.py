@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -119,6 +119,44 @@ def _registry(request: Request) -> MutableSkillRegistry:
     return holder
 
 
+def _inherit_canonical_reference_files(
+    request: Request, slug: str, payload: dict[str, Any]
+) -> None:
+    """Fill a user/team shadow's reference & example files from the built-in.
+
+    A user- or team-scope skill *shadows* a filesystem-canonical built-in at the
+    same slug (ADR 0004): the operator edits the body/voice, but ``user_skills``
+    rows carry no storage for reference or example files. Left alone,
+    :func:`app.api.skills._skill_from_user_skill` emits ``reference_files: []``,
+    so a shadow silently drops the built-in's reference exhibits — the
+    citation-discipline backbone (checklists, rubrics, verified statutory text)
+    the gateway assembler would otherwise inject into the chat prompt.
+
+    Here, when a shadow resolves and a filesystem-canonical skill exists at the
+    same slug, we inherit that built-in's ``reference_files``/``example_files``
+    into the payload. The shadow's edited body still wins; only the missing
+    exhibits are backfilled. A brand-new user skill with no built-in at its slug
+    resolves to no registry record and keeps the empty lists — correct, since
+    there is nothing to inherit.
+
+    Best-effort: the registry not being initialised (e.g., an early-boot probe)
+    leaves the payload untouched rather than raising — the caller still gets a
+    usable skill, just without inherited references.
+    """
+
+    holder: MutableSkillRegistry | None = getattr(request.app.state, "skill_registry", None)
+    if holder is None:
+        return
+    record = holder.current().get(slug)
+    if record is None:
+        return
+    canonical = record.materialise()
+    if canonical.reference_files:
+        payload["reference_files"] = [f.model_dump() for f in canonical.reference_files]
+    if canonical.example_files:
+        payload["example_files"] = [f.model_dump() for f in canonical.example_files]
+
+
 @router.get("/skills/{skill_name}")
 async def get_skill_internal(
     request: Request,
@@ -174,11 +212,15 @@ async def get_skill_internal(
         )
         shadow = (await db.execute(stmt)).scalar_one_or_none()
         if shadow is not None:
-            return JSONResponse(content=_skill_from_user_skill(shadow))
+            payload = _skill_from_user_skill(shadow)
+            _inherit_canonical_reference_files(request, skill_name, payload)
+            return JSONResponse(content=payload)
 
         team_shadow = await _load_team_shadow(db, user_id=user_id, slug=skill_name)
         if team_shadow is not None:
-            return JSONResponse(content=_skill_from_user_skill(team_shadow))
+            payload = _skill_from_user_skill(team_shadow)
+            _inherit_canonical_reference_files(request, skill_name, payload)
+            return JSONResponse(content=payload)
 
     holder = _registry(request)
     registry = holder.current()
