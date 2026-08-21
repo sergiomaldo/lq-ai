@@ -7,6 +7,8 @@ name: CI
 #   - web/    : svelte-check + Vitest
 #   - api/    : ruff + mypy (standard mode) + pytest (with Postgres)
 #   - gateway/: ruff + mypy --strict + pytest
+#   - api/Dockerfile.release: the skills-corpus guard (builds the `skills`
+#     stage only, so no dependency install; see scripts/release-image-check.sh)
 #
 # Out of scope (deferred to future waves):
 #   - Cypress E2E (heavier; needs a stack-up step + LLM provider keys)
@@ -220,3 +222,24 @@ jobs:
 
       - name: pytest
         run: pytest -q
+
+  release-image-checks:
+    name: Release image (skills corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Case 1 of the check needs the real skills/community content, the
+          # same way the release checkout in release.yml requests it.
+          submodules: recursive
+
+      - name: Release image skills-corpus check
+        # The check itself lives in scripts/release-image-check.sh, the single
+        # source of truth, runnable locally. It builds only the `skills` stage
+        # of api/Dockerfile.release (no dependency install), asserts a recursive
+        # checkout bakes the community SKILL.md manifests, and asserts that an
+        # empty submodule, a metadata-only submodule root, and a skills/ tree
+        # without manifests each stop the build at the guard.
+        run: ./scripts/release-image-check.sh
