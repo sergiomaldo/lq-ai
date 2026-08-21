@@ -107,7 +107,9 @@ For features not on the deferred-enhancements list, please file an issue describ
    `ruff format --check` for `api/` and `scripts/`, `mypy app`, and `pytest -q`
    with pgvector Postgres; Gateway runs `uv lock --check`, ruff check/format,
    `mypy app`, and `pytest -q`; Web runs `npm run check:lq-ai` and `npm run
-   test:frontend -- --run`. The path-triggered Stack smoke workflow also runs on
+   test:frontend -- --run`; the Release image job runs
+   `scripts/release-image-check.sh` (the skills-corpus guard in
+   `api/Dockerfile.release`). The path-triggered Stack smoke workflow also runs on
    PRs that change the specified API/Gateway/Web dependency manifests and locks,
    Dockerfiles, compose, API migrations, its script, or its workflow. PRs with
    failing CI are not merged.
@@ -206,6 +208,19 @@ and passes after.
   specifically affects provider integration and credentials are available.
 - **End-to-end tests** — browser end-to-end coverage is not part of the current PR workflow.
 - **Fuzzing** — continuous fuzzing is not part of the current PR workflow.
+
+### Release image skills-corpus check
+
+`api/Dockerfile.release` bakes the repo-root `skills/` corpus into the published api image, and half of that corpus is the `skills/community` submodule. The Dockerfile fails the build unless at least one `skills/community/skills/*/SKILL.md` manifest is present, so a checkout without submodules cannot publish an image that is silently missing those skills. CI runs the check on every PR (`release-image-checks` in `.github/workflows/ci.yml`). It builds only the `skills` stage of the Dockerfile, so it needs no dependency install and finishes in seconds.
+
+Run it locally after touching `api/Dockerfile.release`, `.gitmodules`, or the release checkout in `.github/workflows/release.yml` (needs docker and a recursive checkout):
+
+```bash
+git submodule update --init --recursive
+./scripts/release-image-check.sh
+```
+
+It asserts that this checkout bakes the community manifests, and that an empty submodule directory, a submodule root carrying only README and LICENSE, and a `skills/` tree with no manifest each stop the build at the guard. Set `FULL_IMAGE=1` to also build the complete api release image (slow; pulls docling and torch).
 
 ### Stack smoke test (build + boot the whole stack)
 
