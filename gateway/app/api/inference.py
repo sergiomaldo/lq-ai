@@ -277,11 +277,18 @@ def _failure_reason(error: ProviderAdapterError) -> str:
     ``client_timeout:`` rather than ``upstream_error:`` — we gave up
     waiting, the provider may be healthy — so operators can tell a
     too-tight ``timeout_s`` from a genuine provider outage.
+
+    An accepted-but-empty stream (:class:`ProviderEmptyResponseError`) is
+    prefixed ``empty_response:`` for the same reason — the provider
+    answered, it just produced nothing (issue #503) — so it is not
+    counted as an outage either.
     """
 
     code, _ = _classify_provider_error(error)
     if isinstance(error, ProviderTimeoutError):
         return f"client_timeout:{code}"
+    if isinstance(error, ProviderEmptyResponseError):
+        return f"empty_response:{code}"
     if isinstance(error, ProviderHTTPError):
         return f"upstream_error:{code}:status={error.upstream_status}"
     return f"upstream_error:{code}"
@@ -1246,6 +1253,11 @@ async def _stream_openai_sse(
     if rehydrator is not None and last_chunk is not None:
         tail = rehydrator.flush()
         if tail:
+            # The rehydrator can hold a whole short answer until stream end
+            # (a pseudonym that crystallizes only at flush), so this tail is
+            # real content the in-loop flag never saw. Count it, or the
+            # empty-stream check below fires on a stream that delivered text.
+            produced_content = True
             terminal = last_chunk.model_copy(deep=True)
             for choice in terminal.choices:
                 choice.delta.content = tail

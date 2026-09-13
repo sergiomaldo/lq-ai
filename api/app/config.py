@@ -167,21 +167,12 @@ class Settings(BaseSettings):
             "replayed to the model. 0 disables multi-turn history."
         ),
     )
-    # Raised from 6,000 (issue #503). At 6k, a case file supplied in turn 1 was
-    # silently gone by turn 2 — measured with a ~47,000-token arbitration bundle
-    # on models whose context windows are 200k-1M. Nothing in the response said
-    # trimming had occurred, so the model either answered from the residue or
-    # (correctly, in the observed case) replied that it could no longer see the
-    # documents. For a document-centric tool that is the difference between a
-    # working session and a silently degraded one.
-    #
-    # NOTE for reviewers: this raises a ceiling, and the better fix is narrower.
-    # Attached-file content is injected as a system message (see
-    # ``_format_attached_files_block`` in api/app/api/chats.py) and then counted
-    # against this *chat-history* budget even though it is not conversation.
-    # Excluding injected document blocks from the trim, or giving them their own
-    # budget, fixes the category rather than the symptom. Left as a follow-up so
-    # it gets its own review rather than riding along with a bug fix.
+    # Raised from 6,000 (issue #503): at 6k a ~47,000-token case file supplied
+    # in turn 1 was silently gone by turn 2, on models whose context windows
+    # are 200k-1M, and nothing in the response said trimming had occurred.
+    # This raises a ceiling; the category fix — not counting injected
+    # attached-document blocks (``_format_attached_files_block``) against the
+    # *chat-history* budget at all — is DE-391.
     lq_ai_chat_history_max_messages: int = Field(
         default=20,
         ge=0,
