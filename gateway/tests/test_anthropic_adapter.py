@@ -443,12 +443,13 @@ async def test_network_error_raises_provider_network_error() -> None:
 
 @pytest.mark.unit
 def test_default_timeout_accommodates_long_generations() -> None:
-    """The default per-request timeout is 300s (#15a): frontier drafting
+    """The default per-request timeout is 600s: frontier drafting
     responses of 4-16K output tokens routinely exceed 60s of generation
-    time, and a client-side timeout mid-generation surfaced as a provider
+    time (#318), and a measured document-production turn took 370s
+    (#503). A client-side timeout mid-generation surfaced as a provider
     outage. Per-provider ``timeout_s`` still overrides."""
 
-    assert DEFAULT_TIMEOUT_SECONDS == 300.0
+    assert DEFAULT_TIMEOUT_SECONDS == 600.0
 
 
 @pytest.mark.unit

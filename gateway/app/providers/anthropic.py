@@ -74,15 +74,24 @@ ANTHROPIC_API_VERSION = "2023-06-01"
 """Pinned Anthropic API version. Update deliberately; bump in lockstep
 with changes to the request/response translation below."""
 
-DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_TIMEOUT_SECONDS = 600.0
 """Default per-request timeout. PRD §4.4 / gateway.yaml.example exposes
 ``timeout_s`` on each provider; if absent we use this default.
 
-300s rather than the earlier 60s: frontier drafting responses of
+600s rather than the earlier 60s: frontier drafting responses of
 4-16K output tokens routinely exceed 60s of generation time, and a
 client-side timeout mid-generation surfaced as a provider outage even
-though Anthropic was healthy. Operators wanting a tighter budget set
-``timeout_s`` on the provider entry, which still overrides this."""
+though Anthropic was healthy (#318). A measured document-production
+turn over a ~47k-token case file took 370s (#503), so 300s would still
+have cut real work off. Operators wanting a tighter budget set
+``timeout_s`` on the provider entry, which still overrides this.
+
+Deliberate consequence: the router treats a client timeout as
+fallback-eligible (:func:`app.router.is_fallback_eligible`), so a hung
+connection now waits the full budget before the next provider is
+tried. The api's own gateway-client timeout must stay looser than this
+(``LQ_AI_GATEWAY_TIMEOUT_SECONDS``, default 900s) or it fires first and
+this adapter's label never appears."""
 
 DEFAULT_MAX_TOKENS = 4096
 """Anthropic Messages requires ``max_tokens``. When the OpenAI-format
