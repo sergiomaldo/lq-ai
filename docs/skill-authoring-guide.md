@@ -198,6 +198,27 @@ The user should always know when the skill's analysis is calibrated to their inp
 
 Match these conventions when your skill has the same kind of input. Diverge with intent — divergent naming makes skill chaining harder.
 
+### Refusing declared values
+
+When a skill takes an enum input and some of its values are outside the skill's scope, declare them rather than asking the model to decline. List them under `refuse_values` on the input and give the skill a `refusal_template`:
+
+```yaml
+lq_ai:
+  refusal_template: >
+    This review covers GDPR and CCPA agreements only. It does not cover
+    {{regulatory_regime}} agreements; please ask counsel.
+  inputs:
+    required:
+      - name: regulatory_regime
+        type: enum
+        enum: [gdpr, ccpa, other]
+        refuse_values: [other]
+```
+
+Both fields are also read at the top level of the frontmatter, as `inputs` is. When a message binds a listed value, the backend answers with the template, rendered with `{{name}}` placeholders bound from the declared inputs, and never runs a model. The answer is saved as a refusal message (`routed_provider: policy`, no tokens, no cost) and recorded in the audit log as `chat.skill_input_refused`. Without a template, a fixed text names the skill, the input and the value. Values are compared as text, exactly.
+
+A required input that carries `refuse_values` must be bound on every send: if it is missing or empty the send is refused with 422 `skill_input_missing`, so leaving it out cannot bypass the refusal. Other required inputs are enforced the same way only when the deployment sets `LQ_AI_ENFORCE_REQUIRED_SKILL_INPUTS=true`. The chat composer collects only top-level `inputs`; a skill that nests a refusing input under `lq_ai.inputs` must be called with `skill_inputs` set by the caller.
+
 ---
 
 ## SKILL.md body structure
