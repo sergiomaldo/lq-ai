@@ -311,12 +311,17 @@ class SkillInputDef(BaseModel):
     caller binds one of them, the backend answers with the skill's
     ``refusal_template`` and never runs the model."""
 
-    @field_validator("refuse_values", mode="before")
+    @field_validator("enum", "refuse_values", mode="before")
     @classmethod
-    def _stringify_refuse_values(cls, value: Any) -> Any:
+    def _stringify_values(cls, value: Any) -> Any:
         # YAML turns ``[no, 2024]`` into bools / ints; compare as text.
+        # Without this a non-string value fails validation and the entry
+        # falls back to a name-only stub, silently dropping refuse_values.
+        # A single scalar is read as a one-item list for the same reason.
         if isinstance(value, list):
             return [str(v) for v in value]
+        if isinstance(value, (str, int, float, bool)):
+            return [str(value)]
         return value
 
 
