@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # All built-in M1 skills are filesystem-canonical; user/team-scope forks
 # land later and gain ``user`` / ``team`` values for ``scope``. C1 only
@@ -158,6 +158,14 @@ class LQAIFrontmatter(BaseModel):
         "(a skill with an unconfigured connector still loads and runs).",
     )
 
+    refusal_template: str | None = Field(
+        default=None,
+        description="Plain text the assistant answers with, instead of running "
+        "the model, when a declared input carries a value listed in that "
+        "input's ``refuse_values``. May use ``{{name}}`` placeholders bound "
+        "from the declared inputs. Also accepted at the top level.",
+    )
+
     @model_validator(mode="after")
     def _table_mode_requires_columns(self) -> LQAIFrontmatter:
         """``output_format: table`` requires a non-empty ``columns`` list.
@@ -189,6 +197,9 @@ class SkillFrontmatter(BaseModel):
 
     name: str
     description: str
+    refusal_template: str | None = None
+    """Top-level form of ``lq_ai.refusal_template``; the top level wins
+    when both are set (see :func:`extract_refusal_template`)."""
     lq_ai: LQAIFrontmatter = Field(default_factory=LQAIFrontmatter)
 
 
@@ -295,6 +306,18 @@ class SkillInputDef(BaseModel):
     description: str | None = None
     enum: list[str] | None = None
     default: Any | None = None
+    refuse_values: list[str] | None = None
+    """Values of this input that are out of the skill's scope. When the
+    caller binds one of them, the backend answers with the skill's
+    ``refusal_template`` and never runs the model."""
+
+    @field_validator("refuse_values", mode="before")
+    @classmethod
+    def _stringify_refuse_values(cls, value: Any) -> Any:
+        # YAML turns ``[no, 2024]`` into bools / ints; compare as text.
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return value
 
 
 class SkillInputs(BaseModel):
@@ -373,6 +396,19 @@ def extract_inputs(name: str, frontmatter: SkillFrontmatter) -> SkillInputs:
                 optional.append(coerced)
 
     return SkillInputs(name=name, required=required, optional=optional)
+
+
+def extract_refusal_template(frontmatter: SkillFrontmatter) -> str | None:
+    """Return the skill's ``refusal_template``, or ``None`` when absent.
+
+    Same two locations as :func:`extract_inputs`: the top level first,
+    then ``lq_ai.refusal_template``. Blank text counts as absent.
+    """
+
+    for candidate in (frontmatter.refusal_template, frontmatter.lq_ai.refusal_template):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
 
 
 # --- Internal helpers --------------------------------------------------------
@@ -459,5 +495,6 @@ __all__ = [
     "SkillSummary",
     "derive_summary",
     "extract_inputs",
+    "extract_refusal_template",
     "filter_summary_for_response",
 ]
