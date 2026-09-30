@@ -71,7 +71,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import ActiveUser, is_privileged_reader
-from app.api.skills import _resolve_skill_for_user
+from app.api.skills import _resolve_skill_for_user, resolve_skill_input_policy
 from app.audit import audit_action
 from app.auditor_audit import auditor_audit
 from app.authz.matters import matter_access, require_matter
@@ -97,7 +97,14 @@ from app.citation.ledger import (
 from app.clients.gateway import EnsembleConfig, GatewayClient, get_gateway_client
 from app.config import get_settings
 from app.db.session import get_db
-from app.errors import Conflict, InternalError, LQAIError, NotFound, ValidationError
+from app.errors import (
+    Conflict,
+    InternalError,
+    LQAIError,
+    NotFound,
+    SkillInputMissing,
+    ValidationError,
+)
 from app.knowledge.embed import DEFAULT_EMBEDDING_MODEL, request_embedding_vector
 from app.knowledge.retrieval import HybridSearchResult, hybrid_search
 from app.models.chat import Chat, Message, MessageCitation
@@ -134,11 +141,21 @@ from app.schemas.gateway import (
     ChatCompletionRequest,
     InlineSkillRef,
 )
+from app.skills.policy import (
+    RefusedInput,
+    find_refused_input,
+    missing_required_inputs,
+    render_refusal,
+)
 from app.skills.registry import MutableSkillRegistry, SkillRegistry
 from app.workers.queue import enqueue_treatment_derivation_job
 
 router = APIRouter(prefix="/chats", tags=["chats"])
 log = logging.getLogger(__name__)
+
+# ``routed_provider`` on an assistant turn answered by a skill's declared-value
+# refusal (fork decision S1) rather than by a model.
+SKILL_REFUSAL_PROVIDER = "policy"
 
 # PR5b Task 6 — TTL for pending confirmation rows.
 CONFIRM_TTL: timedelta = timedelta(minutes=15)
@@ -1464,6 +1481,17 @@ async def send_message(
             # Snapshot everything applied this turn as the chat's sticky set.
             chat.sticky_skills = list(effective_skills)
 
+    # Fork decision S1 — skill-input policy, checked here because the
+    # gateway's own required-input check reads only the top-level
+    # ``inputs`` block and the built-in skills nest theirs under
+    # ``lq_ai.inputs``. A missing required input refuses the send before
+    # anything is persisted; a bound value the skill lists in
+    # ``refuse_values`` is answered below with the skill's refusal text,
+    # without calling the gateway. Inline-body skills declare no inputs.
+    skill_refusal = await _check_skill_input_policy(
+        request, db, user_id=user.id, skills=effective_skills, bindings=effective_skill_inputs
+    )
+
     # Persist the user message FIRST. This is unconditionally written,
     # even if the gateway call ultimately fails — the user did say
     # something and the audit trail must reflect that.
@@ -1510,6 +1538,25 @@ async def send_message(
         or request.headers.get("x-correlation-id")
         or f"req_{uuid.uuid4().hex}"
     )
+
+    if skill_refusal is not None:
+        return await _skill_refusal_response(
+            db,
+            user=user,
+            chat=chat,
+            refused=skill_refusal[0],
+            content=skill_refusal[1],
+            assistant_message_id=assistant_message_id,
+            user_message_id=user_message.id,
+            requested_model=payload.model,
+            stream=payload.stream,
+            http_request=request,
+            attached_skill_names=attached_skill_names,
+            slash_unresolved=slash_unresolved,
+            attached_skill_provenance=attached_skill_provenance,
+            applied_file_ids=list(effective_file_ids),
+            request_id=request_id,
+        )
 
     # D1: forward the project's tier floor (if any) so the gateway can
     # enforce ``Project.minimum_inference_tier`` as one of three sources
@@ -2482,6 +2529,196 @@ async def resume_tool_call(
 # ---------------------------------------------------------------------------
 # Internal: persistence flow for non-streaming and streaming
 # ---------------------------------------------------------------------------
+
+
+async def _check_skill_input_policy(
+    request: Request,
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    skills: list[str],
+    bindings: dict[str, dict[str, Any]],
+) -> tuple[RefusedInput, str] | None:
+    """Apply fork decision S1 to the catalogue skills attached this turn.
+
+    Raises :class:`SkillInputMissing` (422) when a required input is
+    missing or empty — every required input when
+    ``LQ_AI_ENFORCE_REQUIRED_SKILL_INPUTS`` is on, otherwise only those
+    that declare ``refuse_values``. Every skill is checked for missing
+    inputs before any refusal is returned. Returns ``(refused, text)``
+    for the first bound value a skill declares out of scope, else None.
+    """
+
+    enforce_all = get_settings().lq_ai_enforce_required_skill_inputs
+    refusal: tuple[RefusedInput, str] | None = None
+    for slug in dict.fromkeys(skills):
+        policy = await resolve_skill_input_policy(request, db, user_id=user_id, slug=slug)
+        if policy is None:
+            continue
+        declared, template = policy
+        skill_bindings = bindings.get(slug, {})
+        missing = missing_required_inputs(declared, skill_bindings, enforce_all=enforce_all)
+        if missing:
+            raise SkillInputMissing(
+                f"Skill {slug!r} is missing required inputs: {', '.join(missing)}.",
+                details={"skill": slug, "missing": missing},
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        if refusal is None:
+            refused = find_refused_input(slug, declared, skill_bindings)
+            if refused is not None:
+                refusal = (refused, render_refusal(template, skill_bindings, refused))
+    return refusal
+
+
+async def _skill_refusal_response(
+    db: AsyncSession,
+    *,
+    user: User,
+    chat: Chat,
+    refused: RefusedInput,
+    content: str,
+    assistant_message_id: uuid.UUID,
+    user_message_id: uuid.UUID,
+    requested_model: str | None,
+    stream: bool,
+    http_request: Request,
+    attached_skill_names: list[str],
+    slash_unresolved: bool,
+    attached_skill_provenance: list[dict[str, str | None]],
+    applied_file_ids: list[str],
+    request_id: str,
+) -> JSONResponse | StreamingResponse:
+    """Persist and return the skill's refusal as the assistant turn.
+
+    The gateway is never called: no routing log, no tokens, no cost, and
+    no work-product attribution (nothing was model-generated). The row
+    is ``kind='refusal'`` with ``routed_provider='policy'``; one
+    ``chat.skill_input_refused`` audit row records the reason. The
+    response has the same shape as a model answer, JSON or SSE.
+    """
+
+    row = Message(
+        id=assistant_message_id,
+        chat_id=chat.id,
+        role="assistant",
+        kind="refusal",
+        content=content,
+        applied_skills=[refused.skill],
+        routed_provider=SKILL_REFUSAL_PROVIDER,
+        requested_model=requested_model,
+        citations=[],
+    )
+    db.add(row)
+    await db.flush()
+
+    project: Project | None = None
+    if chat.project_id is not None:
+        project = await db.get(Project, chat.project_id)
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="chat.skill_input_refused",
+        resource_type="message",
+        resource_id=str(assistant_message_id),
+        project=project,
+        routed_provider=SKILL_REFUSAL_PROVIDER,
+        request=http_request,
+        details={
+            "chat_id": str(chat.id),
+            "user_message_id": str(user_message_id),
+            "reason": "refuse_values",
+            "skill": refused.skill,
+            "input": refused.input,
+            "value": refused.value,
+            "attached_skills": [
+                {"name": e["name"], "source": e["source"], "kind": e["kind"]}
+                for e in attached_skill_provenance
+            ],
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+
+    log.info(
+        "chat send_message refused by skill input policy",
+        extra={
+            "event": "chat_skill_input_refused",
+            "user_id": str(user.id),
+            "chat_id": str(chat.id),
+            "assistant_message_id": str(assistant_message_id),
+            "skill": refused.skill,
+            "input": refused.input,
+            "request_id": request_id,
+        },
+    )
+
+    applied_skills = [refused.skill]
+    if not stream:
+        body = MessagePostResponse(
+            message=message_to_response(row),
+            citations=[],
+            routed_inference_tier=None,
+            routed_provider=SKILL_REFUSAL_PROVIDER,
+            cost_estimate=None,
+            applied_skills=applied_skills,
+            applied_file_ids=applied_file_ids,
+            attached_skill_names=list(attached_skill_names),
+            slash_unresolved=slash_unresolved,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=body.model_dump(mode="json"),
+            headers={"X-LQ-AI-Routed-Provider": SKILL_REFUSAL_PROVIDER},
+        )
+
+    # Same frame sequence as a single-shot streamed answer: start, one
+    # delta carrying the whole text, complete, [DONE].
+    frames: list[dict[str, Any]] = [
+        {
+            "type": "start",
+            "lq_ai_message_id": str(assistant_message_id),
+            "chat_id": str(chat.id),
+        },
+        {
+            "type": "delta",
+            "delta": content,
+            "lq_ai_message_id": str(assistant_message_id),
+            "applied_skills": applied_skills,
+        },
+        {
+            "type": "complete",
+            "lq_ai_message_id": str(assistant_message_id),
+            "message": {
+                "id": str(assistant_message_id),
+                "chat_id": str(chat.id),
+                "role": "assistant",
+                "content": content,
+                "model": None,
+                "provider": SKILL_REFUSAL_PROVIDER,
+                "routed_inference_tier": None,
+                "tokens_in": None,
+                "tokens_out": None,
+                "created_at": row.created_at.isoformat(),
+            },
+            "applied_skills": applied_skills,
+            "applied_file_ids": applied_file_ids,
+            "citations": [],
+            "routed_inference_tier": None,
+            "routed_provider": SKILL_REFUSAL_PROVIDER,
+        },
+    ]
+
+    async def _generate() -> AsyncIterator[bytes]:
+        for frame in frames:
+            yield f"data: {_json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def _audit_message_sent(
