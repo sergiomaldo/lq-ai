@@ -176,6 +176,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Skill-input refusal (fork decision S1). A required input that declares
+    # ``refuse_values`` is always enforced on send, so omitting it cannot
+    # bypass the refusal. Every other required input is enforced only when
+    # this is true: the built-in skills declare required inputs (``document``
+    # and the like) that the chat composer does not collect today, so turning
+    # this on before the composer does would refuse ordinary skill use.
+    lq_ai_enforce_required_skill_inputs: bool = Field(
+        default=False,
+        description=(
+            "Refuse a chat send (422 skill_input_missing) when any required "
+            "input of an attached catalogue skill is missing or empty."
+        ),
+    )
+
     lq_ai_gateway_timeout_seconds: float = Field(
         default=60.0,
         gt=0,

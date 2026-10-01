@@ -47,6 +47,7 @@ from app.skills.schema import (
     SkillFrontmatter,
     SkillInputs,
     extract_inputs,
+    extract_refusal_template,
     filter_summary_for_response,
 )
 
@@ -708,6 +709,18 @@ def _inputs_from_user_skill_row(row: UserSkill) -> SkillInputs:
     an empty schema — same UX as built-ins without inputs.
     """
 
+    frontmatter = _frontmatter_from_user_skill_row(row)
+    if frontmatter is None:
+        # Malformed extras — return empty rather than 500. The skill
+        # still resolves through /skills/{name}; the inspector form
+        # just won't render fields for it.
+        return SkillInputs(name=row.slug)
+    return extract_inputs(row.slug, frontmatter)
+
+
+def _frontmatter_from_user_skill_row(row: UserSkill) -> SkillFrontmatter | None:
+    """Synthesize a SkillFrontmatter from a user/team row, or ``None`` if malformed."""
+
     extras = dict(row.frontmatter_extra or {})
     synthesized = {
         "name": row.slug,
@@ -722,13 +735,42 @@ def _inputs_from_user_skill_row(row: UserSkill) -> SkillInputs:
         synthesized["inputs"] = inputs_block
 
     try:
-        frontmatter = SkillFrontmatter.model_validate(synthesized)
+        return SkillFrontmatter.model_validate(synthesized)
     except Exception:
-        # Malformed extras — return empty rather than 500. The skill
-        # still resolves through /skills/{name}; the inspector form
-        # just won't render fields for it.
-        return SkillInputs(name=row.slug)
-    return extract_inputs(row.slug, frontmatter)
+        return None
+
+
+async def resolve_skill_input_policy(
+    request: Request, db: AsyncSession, *, user_id: uuid.UUID, slug: str
+) -> tuple[SkillInputs, str | None] | None:
+    """Declared inputs + ``refusal_template`` for ``slug``, as the caller sees it.
+
+    Resolution mirrors :func:`get_skill_inputs` (user > team > built-in).
+    Returns ``None`` when the slug resolves nowhere (the gateway reports
+    unknown skills as it does today) or the registry is not installed.
+    """
+
+    for row in (
+        await _load_user_shadow(db, user_id=user_id, slug=slug),
+        await _load_team_shadow(db, user_id=user_id, slug=slug),
+    ):
+        if row is None:
+            continue
+        frontmatter = _frontmatter_from_user_skill_row(row)
+        if frontmatter is None:
+            return SkillInputs(name=row.slug), None
+        return extract_inputs(row.slug, frontmatter), extract_refusal_template(frontmatter)
+
+    holder: MutableSkillRegistry | None = getattr(request.app.state, "skill_registry", None)
+    if holder is None:
+        return None
+    record = holder.current().get(slug)
+    if record is None:
+        return None
+    return (
+        extract_inputs(record.name, record.frontmatter),
+        extract_refusal_template(record.frontmatter),
+    )
 
 
 class SkillForkBody(BaseModel):

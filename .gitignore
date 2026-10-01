@@ -254,3 +254,6 @@ LAUNCH-POST.md
 
 # stack smoke failure diagnostics (scripts/stack-smoke.sh)
 stack-smoke-logs/
+
+# local working notes written by headless sessions; never committed
+STATUS.md

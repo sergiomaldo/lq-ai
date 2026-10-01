@@ -4906,6 +4906,13 @@ components:
         name:
           title: Name
           type: string
+        refuse_values:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Refuse Values
         required:
           default: false
           title: Required

@@ -7522,7 +7522,20 @@ components:
             C2: per-skill input bindings, keyed by skill name. Inner
             dict maps input variable names to values. Required inputs
             that the skill's frontmatter declares but the bindings
-            don't provide cause a 400 with `code=skill_input_missing`.
+            don't provide cause a 400 with `code=skill_input_missing`
+            (gateway check, top-level `inputs` only).
+
+            Fork decision S1: the backend checks each attached catalogue
+            skill's declared inputs (top-level `inputs` and `lq_ai.inputs`)
+            before dispatch. A required input that declares `refuse_values`
+            and is missing or empty answers 422 `skill_input_missing` with
+            `details: {skill, missing: [..]}` and nothing is persisted;
+            every other required input is checked the same way only when
+            `LQ_AI_ENFORCE_REQUIRED_SKILL_INPUTS=true`. A bound value listed
+            in the input's `refuse_values` is answered with the skill's
+            `refusal_template` as a `kind: refusal` assistant message with
+            `routed_provider: policy` and no tokens or cost, in the normal
+            200 JSON or SSE shape; the gateway is not called.
 
             Values are plain scalars interpolated into the skill body via
             `{{name}}` substitution (ADR 0006). There is NO `type:"file"`
@@ -7845,6 +7858,14 @@ components:
           items: {type: string}
           nullable: true
         default: {nullable: true}
+        refuse_values:
+          type: array
+          items: {type: string}
+          nullable: true
+          description: |
+            Fork decision S1: values of this input that are out of the
+            skill's scope. A send that binds one is answered with the
+            skill's `refusal_template` and never reaches a model.
 
     SkillInputs:
       type: object
